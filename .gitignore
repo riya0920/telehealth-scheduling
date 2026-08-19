@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# Generated data and run outputs. Every one is reproducible from the scripts
+# in this repo -- see the README for the command that rebuilds it.
+data/
+out/
+*.db
+*.db-wal
+*.db-shm
+
+# ...except generated figures, which are portfolio evidence and are
+# small. Regenerate with the command in the README.
+!out/
+out/*
+!out/*.png

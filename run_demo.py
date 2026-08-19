@@ -183,7 +183,46 @@ def main():
     print("  availability RULES live in local wall-clock time, recurrences are")
     print("  local, and rendering needs a zone. UTC alone loses the wall-clock")
     print("  semantics that scheduling actually runs on.")
-    payload["dst"] = {"nonexistent_0230_returns_none": nonexistent is None}
+    print()
+    print("  AUTUMN FALL-BACK -- the case UTC storage does NOT solve")
+    print("  2025-11-02: 02:00 EDT -> 01:00 EST, so 01:30 happens TWICE.")
+    kind, both = Scheduler.classify_local_time(date(2025, 11, 2), 1, 30, ET)
+    print(f"    01:30 ET on 2025-11-02 is {kind.upper()}")
+    for inst in both:
+        print(f"      {inst.isoformat()} = "
+              f"{inst.astimezone(ET).strftime('%H:%M')} "
+              f"{inst.astimezone(ET).tzname()}")
+    print("    Two DIFFERENT instants an hour apart that render as the same")
+    print("    wall clock. Booking is unambiguous because storage is UTC.")
+    print("    The CONFIRMATION EMAIL is not:")
+    for inst in both:
+        print(f"      {Scheduler.describe_for_patient(inst, 'America/New_York')}")
+
+    s_night = Scheduler()
+    s_night.add_provider("dr-night", "Dr Night", "America/New_York")
+    s_night.add_licence("dr-night", "NY", "2020-01-01", "2030-01-01")
+    for wd in range(7):
+        s_night.add_working_hours("dr-night", wd, "01:00", "04:00")
+    s_night.add_patient("pat-ny", "Nina", "NY", "America/New_York")
+    s_night.add_visit_type("followup", 30, "video", lead_time_hours=0,
+                           buffer_minutes=0)
+    early = datetime(2025, 1, 1, tzinfo=UTC)
+    print()
+    print("  A provider working 01:00-04:00 local, across each transition:")
+    for d_, label in [(date(2025, 11, 2), "fall-back Sunday"),
+                      (date(2025, 11, 9), "ordinary Sunday"),
+                      (date(2025, 3, 9), "spring-forward Sunday")]:
+        sl = s_night.availability("dr-night", "pat-ny", "followup", d_, now=early)
+        span = (sl[-1] - sl[0]).total_seconds() / 3600 if sl else 0
+        print(f"    {label:<24}{len(sl):>3} slots, "
+              f"{span + 0.5:>4.1f} real hours of availability")
+    print("    The fall-back day genuinely has an EXTRA hour and the")
+    print("    spring-forward day genuinely has one fewer. Collapsing the")
+    print("    repeated hour loses a bookable slot; treating it as one slot")
+    print("    double-books it. Both halves are separately bookable, and a")
+    print("    test proves it.")
+    payload["dst"] = {"nonexistent_0230_returns_none": nonexistent is None,
+                      "fall_back_ambiguous_detected": kind == "ambiguous"}
 
     # =====================================================================
     print("\n" + "=" * 78)

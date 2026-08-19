@@ -412,3 +412,121 @@ def test_tampered_token_is_rejected(token_setup):
                 "signature": tok["signature"]}
     ok, reason = W.verify_token(tampered, a, "provider", starts)
     assert not ok and "signature" in reason
+
+
+# ---------------------------------------------------------------------------
+# DST fall-back -- ambiguous local times
+# ---------------------------------------------------------------------------
+def test_fall_back_local_time_is_detected_as_ambiguous():
+    """2025-11-02 01:30 ET happens TWICE, an hour apart. Python constructs it
+    happily and returns one of them; the scheduler has to know there are two."""
+    kind, both = Scheduler.classify_local_time(date(2025, 11, 2), 1, 30, ET)
+    assert kind == "ambiguous"
+    first, second = both
+    assert (second - first) == timedelta(hours=1)
+    assert first.astimezone(ET).tzname() == "EDT"
+    assert second.astimezone(ET).tzname() == "EST"
+    # both render as the same wall clock, which is precisely the problem
+    assert first.astimezone(ET).strftime("%H:%M") == "01:30"
+    assert second.astimezone(ET).strftime("%H:%M") == "01:30"
+
+
+def test_spring_forward_local_time_is_detected_as_nonexistent():
+    kind, value = Scheduler.classify_local_time(date(2025, 3, 9), 2, 30, ET)
+    assert kind == "nonexistent" and value is None
+
+
+def test_ordinary_local_time_is_unambiguous():
+    kind, value = Scheduler.classify_local_time(date(2025, 6, 4), 9, 0, ET)
+    assert kind == "ok" and value is not None
+
+
+def test_local_instants_returns_two_on_a_fall_back_time():
+    assert len(Scheduler.local_instants(date(2025, 11, 2), 1, 30, ET)) == 2
+    assert len(Scheduler.local_instants(date(2025, 3, 9), 2, 30, ET)) == 0
+    assert len(Scheduler.local_instants(date(2025, 6, 4), 9, 0, ET)) == 1
+
+
+def _span_hours(slots):
+    return (slots[-1] - slots[0]).total_seconds() / 3600 if slots else 0.0
+
+
+@pytest.fixture
+def night_provider():
+    """A provider whose window straddles the DST transition hour."""
+    s = Scheduler()
+    s.add_provider("dr-night", "Dr Night", "America/New_York")
+    s.add_licence("dr-night", "NY", "2020-01-01", "2030-01-01")
+    for weekday in range(7):
+        s.add_working_hours("dr-night", weekday, "01:00", "04:00")
+    s.add_patient("pat-ny", "Nina", "NY", "America/New_York")
+    s.add_visit_type("followup", 30, "video", lead_time_hours=0,
+                     buffer_minutes=0)
+    return s
+
+
+def test_fall_back_day_has_an_extra_hour_of_real_availability(night_provider):
+    """01:00-04:00 local on a fall-back day is FOUR real hours, because 01:00
+    to 02:00 happens twice. Collapsing it to three silently loses a bookable
+    hour; treating the repeated hour as one slot would double-book it."""
+    early = datetime(2025, 1, 1, tzinfo=UTC)
+    fall_back = night_provider.availability(
+        "dr-night", "pat-ny", "followup", date(2025, 11, 2), now=early)
+    normal = night_provider.availability(
+        "dr-night", "pat-ny", "followup", date(2025, 11, 9), now=early)
+    assert len(fall_back) == len(normal) + 2      # two extra 30-minute slots
+    assert _span_hours(fall_back) == pytest.approx(_span_hours(normal) + 1.0)
+
+
+def test_spring_forward_day_loses_an_hour_of_real_availability(night_provider):
+    early = datetime(2025, 1, 1, tzinfo=UTC)
+    spring = night_provider.availability(
+        "dr-night", "pat-ny", "followup", date(2025, 3, 9), now=early)
+    normal = night_provider.availability(
+        "dr-night", "pat-ny", "followup", date(2025, 3, 16), now=early)
+    assert len(spring) == len(normal) - 2
+    assert _span_hours(spring) == pytest.approx(_span_hours(normal) - 1.0)
+
+
+def test_every_generated_slot_is_a_distinct_real_instant(night_provider):
+    """The repeated hour must produce two DIFFERENT UTC instants, not one
+    instant offered twice."""
+    slots = night_provider.availability(
+        "dr-night", "pat-ny", "followup", date(2025, 11, 2),
+        now=datetime(2025, 1, 1, tzinfo=UTC))
+    assert len(set(slots)) == len(slots)
+
+
+def test_both_halves_of_the_repeated_hour_are_separately_bookable(night_provider):
+    """They are different appointments an hour apart, so booking one must not
+    block the other."""
+    slots = night_provider.availability(
+        "dr-night", "pat-ny", "followup", date(2025, 11, 2),
+        now=datetime(2025, 1, 1, tzinfo=UTC))
+    pairs = [(a, b) for a in slots for b in slots
+             if b - a == timedelta(hours=1)
+             and a.astimezone(ET).strftime("%H:%M") == b.astimezone(ET).strftime("%H:%M")]
+    assert pairs, "no repeated wall-clock pair found on the fall-back day"
+    first, second = pairs[0]
+    night_provider.add_patient("pat-2", "Other", "NY", "America/New_York")
+    a = night_provider.book("dr-night", "pat-ny", "followup", first)
+    b = night_provider.book("dr-night", "pat-2", "followup", second)
+    assert a and b and a != b
+
+
+def test_patient_facing_time_is_never_ambiguous():
+    """Storing UTC makes the BOOKING unambiguous and does nothing for the
+    confirmation email. '1:30 AM' on a fall-back date is two appointments."""
+    first, second = Scheduler.local_instants(date(2025, 11, 2), 1, 30, ET)
+    d1 = Scheduler.describe_for_patient(first, "America/New_York")
+    d2 = Scheduler.describe_for_patient(second, "America/New_York")
+    assert d1 != d2, "the two occurrences must be distinguishable to a human"
+    assert "EDT" in d1 and "EST" in d2
+    assert "occurs twice" in d1 and "occurs twice" in d2
+
+
+def test_ordinary_patient_facing_time_carries_the_zone_but_no_warning():
+    dt = Scheduler.local_instants(date(2025, 6, 4), 9, 0, ET)[0]
+    s = Scheduler.describe_for_patient(dt, "America/New_York")
+    assert "EDT" in s
+    assert "occurs twice" not in s

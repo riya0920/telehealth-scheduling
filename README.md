@@ -1,4 +1,4 @@
-# SE-3 — Telehealth scheduling correctness (first 20%)
+# SE-3 — Telehealth scheduling correctness (~50% build)
 
 Scheduling looks like a CRUD tutorial and is a constraint-satisfaction
 minefield. This builds the mines: licensure by state **on the date of service**,
@@ -7,7 +7,7 @@ rather than asserted, and idempotent reminders under crash injection.
 
 ```bash
 python run_demo.py         # concurrency, licensure, DST, crash injection, tokens
-python -m pytest tests -q  # 37 tests
+python -m pytest tests -q  # 47 tests
 ```
 
 Offline, ~3 seconds, standard library only.
@@ -110,9 +110,48 @@ notice until a patient arrived an hour early.
 happily and hands back a plausible instant; returning `None` makes the
 non-existence explicit instead of silently booking someone at 01:30 or 03:30.
 
+**Autumn fall-back, the case UTC storage does *not* solve.** On 2025-11-02 the
+clocks go back at 02:00, so **01:30 happens twice** — two different instants an
+hour apart that render as the same wall clock:
+
+```
+01:30 ET on 2025-11-02 is AMBIGUOUS
+  2025-11-02T05:30:00+00:00 = 01:30 EDT
+  2025-11-02T06:30:00+00:00 = 01:30 EST
+```
+
+`classify_local_time()` returns one of three things — `ok`, `nonexistent`,
+`ambiguous` — because a scheduler that assumes the first is wrong twice a year.
+
+The consequences are concrete and both are tested:
+
+| day (provider works 01:00–04:00 local) | slots | real hours |
+|---|---|---|
+| fall-back Sunday | **8** | **4.0** |
+| ordinary Sunday | 6 | 3.0 |
+| spring-forward Sunday | **4** | **2.0** |
+
+The fall-back day genuinely has an **extra bookable hour** and the
+spring-forward day genuinely has one fewer. Collapsing the repeated hour loses a
+slot; treating it as one slot double-books it.
+`test_both_halves_of_the_repeated_hour_are_separately_bookable` books both.
+
+And the half that UTC discipline cannot fix — **the confirmation email**:
+
+```
+Sun 02 Nov 2025, 01:30 AM EDT (this local time occurs twice tonight ...)
+Sun 02 Nov 2025, 01:30 AM EST (this local time occurs twice tonight ...)
+```
+
+Storing UTC makes the *booking* unambiguous and does nothing for the *rendering*.
+"Sunday 2 November, 1:30 AM" is two different appointments and the patient has
+no way to tell which one they have, so `describe_for_patient()` always carries
+the zone and flags the ambiguity.
+
 *Why "we store everything in UTC" is necessary but not sufficient:* availability
 **rules** live in local wall-clock time, recurrences are local, and rendering
-needs a zone. UTC alone loses the wall-clock semantics that scheduling runs on.
+needs a zone. UTC alone loses the wall-clock semantics that scheduling runs on —
+and it is silent about a wall clock that happens twice.
 
 ### 4. Idempotent reminders under crash injection
 
@@ -169,10 +208,10 @@ transaction, not by the query that selected it.
 - **No recurring-availability model.** Working hours are per weekday; there is
   no RRULE, no series booking, no "move the whole series" operation — which is
   where DST bugs really live.
-- **No fall-back DST handling.** Spring-forward (nonexistent times) is handled
-  and tested; **autumn fall-back (ambiguous times, where 01:30 happens twice) is
-  not** — `fold` is never set, so an appointment at 01:30 on the fall-back date
-  resolves arbitrarily. That is a real gap, not a rounding error.
+- **No recurrence expansion across a transition.** Both DST directions are now
+  handled for a single day, but there is still no RRULE model, so "move the
+  whole series" — where DST bugs really live — is untested because series do
+  not exist.
 - **No overbooking or capacity policy**, no provider panels, no group visits, no
   interpreter or resource scheduling.
 - **Licensure is a flat state list.** No compact-state handling (the Interstate
@@ -188,4 +227,4 @@ transaction, not by the query that selected it.
 | `src/scheduling.py` | domain model, licensure, availability, booking under concurrency |
 | `src/workflow.py` | idempotent reminders, no-shows, waitlist holds, video tokens |
 | `run_demo.py` | concurrency proof, licensure traps, DST suite, crash injection |
-| `tests/test_scheduling.py` | 37 tests |
+| `tests/test_scheduling.py` | 47 tests |

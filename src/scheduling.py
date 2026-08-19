@@ -312,27 +312,96 @@ class Scheduler:
         return slots
 
     @staticmethod
-    def _local_to_utc(day, hour, minute, tz):
-        """Local wall clock -> UTC instant, or None if that time does not exist.
+    def classify_local_time(day, hour, minute, tz):
+        """Resolve a local wall clock against a timezone's DST transitions.
 
-        Spring forward: 02:30 on the transition day is a time that never
-        occurs. Python will happily construct it and produce a plausible
-        instant; returning None instead makes the non-existence explicit rather
-        than silently booking someone at 01:30 or 03:30.
+        A wall-clock time is one of three things, and a scheduler that assumes
+        the first is wrong twice a year:
+
+          ("ok", dt)                    -- occurs exactly once
+          ("nonexistent", None)         -- SPRING FORWARD. 02:30 on the
+                                           transition day never happens.
+          ("ambiguous", (first, second))-- AUTUMN FALL-BACK. 01:30 happens
+                                           TWICE, an hour apart, and they are
+                                           genuinely different instants.
+
+        Python constructs all three happily and hands back a plausible instant
+        for the two broken cases, which is why they have to be detected rather
+        than trusted. `fold` distinguishes the two occurrences of an ambiguous
+        time: fold=0 is the first (still on daylight time), fold=1 the second.
         """
         naive = datetime(day.year, day.month, day.day, hour, minute)
-        aware = naive.replace(tzinfo=tz)
-        # A nonexistent local time normalises to a different wall clock in UTC
-        round_trip = aware.astimezone(UTC).astimezone(tz)
+        first = naive.replace(tzinfo=tz, fold=0)
+        second = naive.replace(tzinfo=tz, fold=1)
+
+        # Nonexistent: the wall clock does not survive a round trip through UTC
+        round_trip = first.astimezone(UTC).astimezone(tz)
         if (round_trip.hour, round_trip.minute) != (hour, minute):
+            return "nonexistent", None
+
+        # Ambiguous: the two folds map to DIFFERENT instants
+        if first.utcoffset() != second.utcoffset():
+            return "ambiguous", (first.astimezone(UTC), second.astimezone(UTC))
+
+        return "ok", first.astimezone(UTC)
+
+    @staticmethod
+    def _local_to_utc(day, hour, minute, tz):
+        """Single UTC instant for a local wall clock, or None if it does not
+        exist. For an AMBIGUOUS time this returns the FIRST occurrence; callers
+        that need both must use `classify_local_time`."""
+        kind, value = Scheduler.classify_local_time(day, hour, minute, tz)
+        if kind == "nonexistent":
             return None
-        return aware.astimezone(UTC)
+        if kind == "ambiguous":
+            return value[0]
+        return value
+
+    @staticmethod
+    def local_instants(day, hour, minute, tz):
+        """Every real instant matching this local wall clock -- 0, 1, or 2.
+
+        This is what availability generation actually needs. On a fall-back day
+        the local calendar genuinely contains two 01:30s, and a provider whose
+        hours span the transition genuinely has an extra hour of availability.
+        Collapsing them to one silently loses a bookable slot; treating them as
+        one slot double-books it.
+        """
+        kind, value = Scheduler.classify_local_time(day, hour, minute, tz)
+        if kind == "nonexistent":
+            return []
+        if kind == "ambiguous":
+            return [value[0], value[1]]
+        return [value]
 
     @staticmethod
     def to_patient_time(utc_dt, patient_tz):
         """Render an instant in the PATIENT's zone. Availability shown in the
         provider's zone is a support ticket waiting to happen."""
         return utc_dt.astimezone(ZoneInfo(patient_tz))
+
+    @staticmethod
+    def describe_for_patient(utc_dt, patient_tz):
+        """A human-facing string that is never ambiguous.
+
+        Storing UTC makes the BOOKING unambiguous. It does nothing for the
+        CONFIRMATION EMAIL: "Sunday 2 November, 1:30 AM" is two different
+        appointments an hour apart on a fall-back date, and the patient has no
+        way to tell which one they have.
+
+        So the zone abbreviation is always included, and on an ambiguous local
+        time the string is marked explicitly. This is the half of DST
+        correctness that no amount of UTC discipline fixes, because the problem
+        is in the rendering rather than in the storage.
+        """
+        local = utc_dt.astimezone(ZoneInfo(patient_tz))
+        kind, _v = Scheduler.classify_local_time(
+            local.date(), local.hour, local.minute, ZoneInfo(patient_tz))
+        stamp = local.strftime("%a %d %b %Y, %I:%M %p ") + local.tzname()
+        if kind == "ambiguous":
+            return (f"{stamp} (this local time occurs twice tonight because "
+                    f"the clocks go back -- {local.tzname()} is the one you want)")
+        return stamp
 
     # -- booking ---------------------------------------------------------
     def book(self, provider_id, patient_id, visit_type_id, start_utc,

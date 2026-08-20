@@ -193,7 +193,7 @@ transaction, not by the query that selected it.
 
 ---
 
-## What is missing (the other 80%)
+## What is still missing
 
 - **No Postgres**, therefore no exclusion constraint — the substitution and its
   weaknesses are documented above and in the code, but the elegant answer is

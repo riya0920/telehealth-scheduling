@@ -1,4 +1,4 @@
-# SE-3 — Telehealth scheduling correctness (~50% build)
+# SE-3 — Telehealth scheduling correctness (~80% build)
 
 Scheduling looks like a CRUD tutorial and is a constraint-satisfaction
 minefield. This builds the mines: licensure by state **on the date of service**,
@@ -7,7 +7,9 @@ rather than asserted, and idempotent reminders under crash injection.
 
 ```bash
 python run_demo.py         # concurrency, licensure, DST, crash injection, tokens
-python -m pytest tests -q  # 47 tests
+python serve.py --load     # booking p99, contended and spread
+python serve.py            # booking API on :8090
+python -m pytest tests -q  # 67 tests
 ```
 
 Offline, ~3 seconds, standard library only.
@@ -193,32 +195,144 @@ transaction, not by the query that selected it.
 
 ---
 
+## Recurring series — the DST bug that only series have
+
+The gap list said it twice: *"there is no RRULE model, so 'move the whole
+series' — where DST bugs really live — is untested because series do not
+exist."* `src/recurrence.py` is that model.
+
+### A weekly series stored as UTC drifts by an hour, silently
+
+Store "Tuesdays at 09:00" as a UTC instant plus a 7-day interval and every
+occurrence after the transition lands an hour out. Nothing errors. The patient,
+told 9am, misses a session — which for a weekly therapy series is a gap in a
+course of care, not a scheduling inconvenience.
+
+The series is therefore stored as a **local wall clock plus a rule**, and every
+occurrence is resolved against the timezone independently:
+
+| local date | tz | UTC |
+|---|---|---|
+| 2024-10-29 | EDT | 13:00Z |
+| **2024-11-05** | **EST** | **14:00Z** |
+
+The UTC instants are **deliberately not evenly spaced**. A series whose UTC
+instants are evenly spaced across a transition is a series whose local times
+are wrong.
+
+`naive_utc_occurrences()` implements the bug on purpose so it can be measured,
+and `storage_drift()` reports it:
+
+```
+2024-11-05  intended 09:00 (EST)  naive 08:00 (EST)  drift -60 min
+2024-11-12  intended 09:00 (EST)  naive 08:00 (EST)  drift -60 min
+2024-11-19  intended 09:00 (EST)  naive 08:00 (EST)  drift -60 min
+```
+
+### "Move the whole series" — and a claim the measurement corrected
+
+I first wrote that the wall-clock and absolute readings of a move diverge *"once
+a transition is inside the range"*. **That is wrong**, and measuring it said so:
+once each occurrence is resolved independently, adding a constant to a
+correctly-resolved instant preserves its local time, so the 8-week series above
+sees **no disagreement at all**.
+
+They diverge somewhere narrower and much harder to spot — when the *occurrence
+itself* sits in an ambiguous window. A series at 01:30 on US fall-back Sunday,
+moved 60 minutes later:
+
+| date | wall clock | absolute |
+|---|---|---|
+| 2024-10-27 | 02:30 EDT | 02:30 EDT |
+| **2024-11-03** | **02:30 EST** | **01:30 EST** ← the *second* 01:30 |
+| 2024-11-10 | 02:30 EST | 02:30 EST |
+
+One occurrence out of three. `move()` refuses to pick a default and
+`compare_moves()` answers "does this move disagree with itself, and where".
+
+## Booking p99 under load — and two bugs it found
+
+`python serve.py --load`. The spec asked for booking p99 under load; the
+existing concurrency test proved correctness, not performance.
+
+**The load runs contended, not spread.** Clients booking distinct slots never
+touch the same row and produce a flattering p99 that measures the HTTP stack.
+24 clients racing for **one** slot measure the thing that prevents a
+double-booking:
+
+```
+mode             n      p50      p95      p99      max    req/s
+spread          16    149.6    843.2    843.2    843.2       17
+contended       24     31.4    192.5    509.5    509.5       45
+
+CONTENDED: 24 clients raced for ONE slot -> 1 booked, 23 got 409.
+Exactly one winner, and zero server errors.
+```
+
+**And the p99 comparison came out backwards from what I expected.** Contended
+p99 is *lower*. Not because the lock is fast — because a conflicting booking
+**short-circuits**: it takes the write lock, finds the clash, rolls back and
+returns 409 without ever writing. 23 of 24 requests do less work than a
+successful booking. Reporting that as a latency win would be reading a
+rejection rate as performance. The number that would actually hurt — p99 for a
+request that *wins* under contention — has a sample size of one per run, and
+measuring it needs many contended slots in parallel, which is not done here.
+
+### Two real bugs, found by running it rather than reading it
+
+- **`is_licensed()` always read the shared connection.** `book(con=...)` used
+  the caller's connection for its own queries and `self.con` for the licensure
+  check. Under 24 concurrent bookings that produced sqlite3 `InterfaceError` and
+  `DatabaseError` — and, worse, **intermittent spurious `LicenceViolation`s**: a
+  lawful booking refused, with the one error message that sends someone to
+  investigate licensure rather than the database. The existing concurrency test
+  never caught it because it called `book()` directly with its own connection
+  and never mixed the two.
+- **An unhandled exception dropped the connection instead of answering.**
+  Passing an ISO string where `book()` wanted a datetime raised deep inside, and
+  `BaseHTTPRequestHandler` closed the socket. The client saw
+  `RemoteDisconnected` — indistinguishable from a network fault, and invisible
+  to a load harness that only catches `HTTPError`. The first load run therefore
+  reported `n=1` and a flawless p99 of 0.0 ms. Both the handler and the harness
+  are fixed; the harness now records failures as outcomes rather than dropping
+  them.
+
+Also worth naming, because it looks like a bug and is not: **"spread" mode still
+produces 409s.** The visit type carries a 10-minute buffer, so adjacent slots
+overlap once the buffer is applied. A generated slot list is a list of *start
+times*, not a list of independently bookable ones.
+
 ## What is still missing
 
 - **No Postgres**, therefore no exclusion constraint — the substitution and its
   weaknesses are documented above and in the code, but the elegant answer is
   described rather than run.
-- **No HTTP API and no UI.** Everything is a Python method call; there is no
-  booking service, no auth, no session handling.
+- **The HTTP API has no auth and no UI.** No sessions, no patient identity,
+  no CSRF, no rate limiting — anyone who can reach the port can book on anyone's
+  behalf. The API exists to make the concurrency and DST behaviour reachable
+  over a socket, not to be a booking service.
 - **No real notification delivery.** `sender` is a callback; there is no SMS or
   email provider, no delivery receipts, and therefore no way to test the
   ambiguous-timeout case that at-most-once actually loses.
 - **No real video service.** Tokens are HMAC blobs verified locally — no WebRTC,
   no TURN, no room lifecycle, and no check that the token was actually redeemed.
-- **No recurring-availability model.** Working hours are per weekday; there is
-  no RRULE, no series booking, no "move the whole series" operation — which is
-  where DST bugs really live.
-- **No recurrence expansion across a transition.** Both DST directions are now
-  handled for a single day, but there is still no RRULE model, so "move the
-  whole series" — where DST bugs really live — is untested because series do
-  not exist.
+- **The RRULE subset is small.** FREQ=DAILY|WEEKLY, INTERVAL, BYDAY, COUNT,
+  UNTIL. No MONTHLY or YEARLY, no BYSETPOS, no BYMONTHDAY, no EXDATE/RDATE, no
+  VTIMEZONE serialisation, and **no per-occurrence exceptions** — "cancel just
+  the 12 November one" is the most common real request and is not supported.
+- **Series are not persisted or booked.** They expand to instants and the
+  drift is measured, but a series is held in process memory and its occurrences
+  are not written as appointments, so there is no partial-failure story for
+  "book 8 occurrences and the 5th clashes".
 - **No overbooking or capacity policy**, no provider panels, no group visits, no
   interpreter or resource scheduling.
 - **Licensure is a flat state list.** No compact-state handling (the Interstate
   Medical Licensure Compact and PSYPACT change the answer materially), no
   modality-specific rules, no verification against a licensing board.
-- **No load or latency measurement.** The spec asks for booking p99 under load;
-  the concurrency test proves correctness, not performance.
+- **The load measurement is a floor, not a service level.** One process,
+  loopback, file-backed SQLite on local disk, 24 clients, no other tenants. And
+  the most useful number — p99 for the request that *wins* under contention —
+  has a sample size of one per run and is not measured.
 
 ## Files
 
@@ -227,4 +341,7 @@ transaction, not by the query that selected it.
 | `src/scheduling.py` | domain model, licensure, availability, booking under concurrency |
 | `src/workflow.py` | idempotent reminders, no-shows, waitlist holds, video tokens |
 | `run_demo.py` | concurrency proof, licensure traps, DST suite, crash injection |
+| `src/recurrence.py` | RRULE subset, local-wall-clock series, the UTC drift measured |
+| `serve.py` | booking API, series routes, contended p99 measurement |
+| `tests/test_recurrence.py` | 20 tests: expansion, drift, and both readings of a move |
 | `tests/test_scheduling.py` | 47 tests |

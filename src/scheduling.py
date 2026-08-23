@@ -207,17 +207,29 @@ class Scheduler:
                           buffer_minutes))
 
     # -- licensure -------------------------------------------------------
-    def is_licensed(self, provider_id, state, service_date):
+    def is_licensed(self, provider_id, state, service_date, con=None):
         """Licensed in `state` on the DATE OF SERVICE.
 
         The date-of-service check, not the booking date, is the entire point.
         A licence that is valid today and expires before the appointment is a
         licence the provider will not hold when they deliver the care.
+
+        TAKES A CONNECTION, and callers inside a transaction must pass theirs.
+        It previously always read `self.con`, so `book(con=...)` used the
+        caller's connection for its own queries and the SHARED one for this
+        check. Under 24 concurrent bookings against a threaded server that
+        produced sqlite3 InterfaceError/DatabaseError and -- worse --
+        intermittent spurious LicenceViolations: a lawful booking refused, and
+        refused with the one error message that sends someone to look at
+        licensure rather than at the database. Found by the load test in
+        serve.py, not by the concurrency test, because the concurrency test
+        called book() directly with its own connection and never went through
+        a code path that mixed the two.
         """
         if isinstance(service_date, datetime):
             service_date = service_date.date()
         d = service_date.isoformat()
-        row = self.con.execute(
+        row = (con or self.con).execute(
             "SELECT 1 FROM licence WHERE provider_id=? AND state=? "
             "AND effective_on <= ? AND expires_on >= ? LIMIT 1",
             (provider_id, state, d, d)).fetchone()
@@ -423,7 +435,7 @@ class Scheduler:
         state = con.execute(
             "SELECT home_state FROM patient WHERE patient_id=?",
             (patient_id,)).fetchone()[0]
-        if not self.is_licensed(provider_id, state, start_utc.date()):
+        if not self.is_licensed(provider_id, state, start_utc.date(), con):
             raise LicenceViolation(
                 f"{provider_id} is not licensed in {state} on "
                 f"{start_utc.date().isoformat()} (the DATE OF SERVICE)")

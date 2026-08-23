@@ -1,4 +1,4 @@
-# SE-3 — Telehealth scheduling correctness (~80% build)
+# SE-3 — Telehealth scheduling correctness — complete
 
 Scheduling looks like a CRUD tutorial and is a constraint-satisfaction
 minefield. This builds the mines: licensure by state **on the date of service**,
@@ -9,7 +9,7 @@ rather than asserted, and idempotent reminders under crash injection.
 python run_demo.py         # concurrency, licensure, DST, crash injection, tokens
 python serve.py --load     # booking p99, contended and spread
 python serve.py            # booking API on :8090
-python -m pytest tests -q  # 67 tests
+python -m pytest tests -q  # 90 tests
 ```
 
 Offline, ~3 seconds, standard library only.
@@ -302,37 +302,108 @@ produces 409s.** The visit type carries a 10-minute buffer, so adjacent slots
 overlap once the buffer is applied. A generated slot list is a list of *start
 times*, not a list of independently bookable ones.
 
-## What is still missing
+## Licensure compacts — not a longer state list
 
-- **No Postgres**, therefore no exclusion constraint — the substitution and its
-  weaknesses are documented above and in the code, but the elegant answer is
-  described rather than run.
-- **The HTTP API has no auth and no UI.** No sessions, no patient identity,
-  no CSRF, no rate limiting — anyone who can reach the port can book on anyone's
-  behalf. The API exists to make the concurrency and DST behaviour reachable
-  over a socket, not to be a booking service.
+`src/compact.py`. The previous gap list said a flat state list misses that "the
+Interstate Medical Licensure Compact and PSYPACT change the answer materially".
+The naive fix — expand a compact into its member states — is wrong in three
+specific ways, and each changes a real answer.
+
+**A compact is not a licence.** The IMLC is an *expedited pathway to obtain*
+one. It does not let a physician practise in 40 states; it lets them get
+licensed in a member state quickly, and the licence still has to be issued.
+`authorises("IMLC", ...)` returns **False in every case**, and says why —
+treating membership as authorisation would put a provider in front of a patient
+in a state where they hold nothing.
+
+**PSYPACT is different in kind, not degree.** It grants an actual Authority to
+Practice Interjurisdictional Telepsychology, which genuinely is "one credential,
+many states". So the two cannot share a code path even though both are called
+compacts.
+
+**Compacts are profession- and modality-specific.** PSYPACT covers
+telepsychology by psychologists; an in-person visit is not covered by an
+interjurisdictional *telepractice* authority, and a physician is not covered at
+all. A flat state list can express neither.
+
+**And membership has a date.** States joined PSYPACT on different dates through
+the 2020s, so `authorises` takes the **date of service** — exactly as
+`is_licensed` does. A state that joins next month does not authorise an
+appointment booked for next week.
+
+`check()` tries the **licence first**: a held licence is the strongest and
+simplest answer, so the common case never touches compact logic. When it fails,
+`why_not()` returns every compact and why each does or does not help — because
+*"not licensed"* is an answer a front desk cannot act on, and *"PSYPACT would
+cover this but Virginia joined after the date of service"* is one they can.
+
+## Per-occurrence exceptions — the most common real request
+
+`EXDATE` removes one occurrence **without touching the rule**. Rewriting the
+rule to route around a date changes what every *other* occurrence means, and
+nothing in the new rule records that a cancellation ever happened.
+
+```
+base      2024-10-01  10-08  10-15  10-22  10-29  11-05
+exclude   2024-10-01  10-08  ─────  10-22  10-29  11-05
+rrule     FREQ=WEEKLY;BYDAY=TU;COUNT=6;EXDATE=20241015
+```
+
+**COUNT is consumed before EXDATE is applied** (RFC 5545 §3.8.5.1), so an
+excluded occurrence still counts and the series **ends on the same date**.
+Backwards, and cancelling one week silently books the patient an extra one.
+
+## Booking a series, and the partial-failure story
+
+The named gap: *"there is no partial-failure story for 'book 8 occurrences and
+the 5th clashes'."* There are three, because the right answer depends on what
+the series **is** and no default is right for both:
+
+| policy | correct when |
+|---|---|
+| `best-effort` | a **therapy course** — seven sessions plus one to rearrange beats none |
+| `all-or-nothing` | a **titration schedule** — one with a gap is not a shorter titration, it is a different and possibly unsafe one |
+| `stop-at-first-clash` | later occurrences **depend on** earlier ones |
+
+`book_series` refuses an unknown policy rather than defaulting, for that reason.
+
+**A nonexistent occurrence is not a clash.** Spring-forward can delete an
+occurrence's wall-clock time entirely; that is a scheduling fact, not a
+conflict, and reporting it as one invites someone to "fix" it by moving the
+whole series.
+
+## What is still missing, and why it cannot be closed here
+
+- **No Postgres, therefore no exclusion constraint.** Not installed. The
+  elegant answer — let the database refuse an overlapping booking structurally —
+  is described in the code and substituted with `BEGIN IMMEDIATE`, whose
+  weaknesses are documented at the use site.
+- **The compact membership lists are illustrative, not current.** Membership
+  changes by legislative session, and a real deployment verifies against the
+  compact commissions and the state boards — and *re-verifies*, because a
+  licence can be suspended between the booking and the visit. There is no DEA
+  registration, no controlled-substance rule, no originating-site requirement,
+  and no consent-by-state handling.
 - **No real notification delivery.** `sender` is a callback; there is no SMS or
-  email provider, no delivery receipts, and therefore no way to test the
-  ambiguous-timeout case that at-most-once actually loses.
+  email provider and no delivery receipts, so the ambiguous-timeout case that
+  at-most-once actually loses cannot be exercised.
 - **No real video service.** Tokens are HMAC blobs verified locally — no WebRTC,
-  no TURN, no room lifecycle, and no check that the token was actually redeemed.
-- **The RRULE subset is small.** FREQ=DAILY|WEEKLY, INTERVAL, BYDAY, COUNT,
-  UNTIL. No MONTHLY or YEARLY, no BYSETPOS, no BYMONTHDAY, no EXDATE/RDATE, no
-  VTIMEZONE serialisation, and **no per-occurrence exceptions** — "cancel just
-  the 12 November one" is the most common real request and is not supported.
-- **Series are not persisted or booked.** They expand to instants and the
-  drift is measured, but a series is held in process memory and its occurrences
-  are not written as appointments, so there is no partial-failure story for
-  "book 8 occurrences and the 5th clashes".
-- **No overbooking or capacity policy**, no provider panels, no group visits, no
-  interpreter or resource scheduling.
-- **Licensure is a flat state list.** No compact-state handling (the Interstate
-  Medical Licensure Compact and PSYPACT change the answer materially), no
-  modality-specific rules, no verification against a licensing board.
+  no TURN, no room lifecycle, no check that a token was redeemed.
+- **The HTTP API has no auth and no UI.** No sessions, no patient identity, no
+  CSRF, no rate limiting. It exists to make the concurrency and DST behaviour
+  reachable over a socket, not to be a booking service.
+- **The RRULE subset is still small.** FREQ=DAILY|WEEKLY, INTERVAL, BYDAY,
+  COUNT, UNTIL, EXDATE. No MONTHLY or YEARLY, no BYSETPOS, no BYMONTHDAY, no
+  RDATE, no VTIMEZONE serialisation. `dateutil.rrule` does this properly and is
+  not installed.
+- **Series are not persisted.** `book_series` writes appointments, but the
+  series itself lives in process memory — so a cancellation after a restart has
+  no rule to attach an EXDATE to.
+- **No overbooking or capacity policy**, no provider panels, no group visits,
+  no interpreter or resource scheduling.
 - **The load measurement is a floor, not a service level.** One process,
-  loopback, file-backed SQLite on local disk, 24 clients, no other tenants. And
-  the most useful number — p99 for the request that *wins* under contention —
-  has a sample size of one per run and is not measured.
+  loopback, file-backed SQLite, 24 clients. The most useful number — p99 for
+  the request that *wins* under contention — has a sample size of one per run.
 
 ## Files
 
@@ -343,5 +414,7 @@ times*, not a list of independently bookable ones.
 | `run_demo.py` | concurrency proof, licensure traps, DST suite, crash injection |
 | `src/recurrence.py` | RRULE subset, local-wall-clock series, the UTC drift measured |
 | `serve.py` | booking API, series routes, contended p99 measurement |
+| `src/compact.py` | IMLC vs PSYPACT, date-of-service membership, why_not() |
+| `tests/test_compact.py` | 23 tests: the pathway/authority split, EXDATE, three policies |
 | `tests/test_recurrence.py` | 20 tests: expansion, drift, and both readings of a move |
 | `tests/test_scheduling.py` | 47 tests |

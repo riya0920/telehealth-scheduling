@@ -105,7 +105,7 @@ def parse_rrule(text):
         k, v = chunk.split("=", 1)
         parts[k.upper()] = v.upper()
 
-    known = {"FREQ", "INTERVAL", "BYDAY", "COUNT", "UNTIL"}
+    known = {"FREQ", "INTERVAL", "BYDAY", "COUNT", "UNTIL", "EXDATE"}
     unknown = set(parts) - known
     if unknown:
         raise RecurrenceError(
@@ -130,6 +130,15 @@ def parse_rrule(text):
         rule["byday"] = [WEEKDAYS[d] for d in days]
     if "COUNT" in parts:
         rule["count"] = int(parts["COUNT"])
+    if "EXDATE" in parts:
+        # EXDATE removes specific occurrences WITHOUT changing the rule. That
+        # distinction is the whole point: "cancel just the 12 November one" is
+        # the most common real request, and re-writing the rule to route around
+        # one date changes what every OTHER occurrence means.
+        rule["exdate"] = sorted({
+            date.fromisoformat(d[:4] + "-" + d[4:6] + "-" + d[6:8]
+                               if "-" not in d else d[:10])
+            for d in parts["EXDATE"].split(",") if d.strip()})
     if "UNTIL" in parts:
         rule["until"] = date.fromisoformat(
             parts["UNTIL"][:4] + "-" + parts["UNTIL"][4:6] + "-"
@@ -149,6 +158,9 @@ def format_rrule(rule):
         out.append(f"COUNT={rule['count']}")
     if rule.get("until"):
         out.append("UNTIL=" + rule["until"].isoformat().replace("-", ""))
+    if rule.get("exdate"):
+        out.append("EXDATE=" + ",".join(d.isoformat().replace("-", "")
+                                        for d in rule["exdate"]))
     return "RRULE:" + ";".join(out)
 
 
@@ -199,8 +211,15 @@ class Series:
             if take:
                 if r.get("until") and d > r["until"]:
                     break
-                out.append(d)
+                # COUNT IS CONSUMED BEFORE EXDATE IS APPLIED (RFC 5545 3.8.5.1).
+                # An excluded occurrence still counts toward COUNT, so
+                # cancelling one appointment SHORTENS the series rather than
+                # sliding a replacement onto the end. Getting this backwards
+                # silently adds a session nobody scheduled -- and the patient
+                # who cancelled one week would be booked an extra one.
                 seen += 1
+                if d not in (r.get("exdate") or ()):
+                    out.append(d)
                 if r.get("count") and seen >= r["count"]:
                     break
             d += step
@@ -381,3 +400,127 @@ def storage_drift(series, scheduler_cls, horizon_days=730):
                 if c["utc"] else None,
             })
     return rows
+
+
+def exclude(series, when):
+    """Cancel ONE occurrence without touching the rule.
+
+    Returns a new Series. The rule is unchanged and the excluded date is
+    recorded as an EXDATE, so the series still reads "Tuesdays at 9" and the
+    cancellation is visible as a cancellation rather than as a different
+    schedule.
+
+    The alternative -- rewriting the rule to route around one date -- changes
+    what every other occurrence means, and is unrecoverable: nothing in the new
+    rule records that a cancellation ever happened.
+    """
+    when = date.fromisoformat(when) if isinstance(when, str) else when
+    rule = dict(series.rule)
+    rule["exdate"] = sorted(set(rule.get("exdate", ())) | {when})
+    return Series(series.series_id, series.provider_id, series.patient_id,
+                  series.visit_type_id, series.anchor_date, series.hour,
+                  series.minute, series.tz, rule, series.duration_minutes)
+
+
+# ---------------------------------------------------------------------------
+# booking a series
+# ---------------------------------------------------------------------------
+
+def book_series(series, scheduler, scheduler_cls, *, policy="best-effort",
+                actor="patient", con_factory=None):
+    """Book every occurrence. Returns what happened to each.
+
+    THE PARTIAL-FAILURE STORY, which is the named gap: "book 8 occurrences and
+    the 5th clashes". Three policies, because the right answer depends on what
+    the series IS and no default is right for both:
+
+      BEST-EFFORT   book what is free, report what is not. Correct for a
+                    therapy series -- seven sessions plus one to rearrange is
+                    better than none, and the patient would rather have the
+                    seven.
+
+      ALL-OR-NOTHING  roll back everything if any occurrence clashes. Correct
+                    when the series only makes sense complete: a titration
+                    schedule with a gap in the middle is not a shorter
+                    titration, it is a different and possibly unsafe one.
+
+      STOP-AT-FIRST-CLASH  book up to the clash and stop. Correct when later
+                    occurrences depend on earlier ones and booking past a gap
+                    would schedule sessions that assume something that did not
+                    happen.
+
+    A NONEXISTENT OCCURRENCE IS NOT A CLASH. Spring-forward can delete an
+    occurrence's wall-clock time entirely, and that is a scheduling fact rather
+    than a conflict -- it is reported separately so it is not confused with a
+    double-booking, and so nobody "fixes" it by moving the whole series.
+    """
+    if policy not in ("best-effort", "all-or-nothing", "stop-at-first-clash"):
+        raise RecurrenceError(
+            f"unknown policy {policy!r}. The right answer depends on what the "
+            f"series IS -- a therapy course tolerates a gap, a titration "
+            f"schedule does not -- so there is no safe default.")
+
+    from scheduling import LicenceViolation, SchedulingError, SlotTaken
+
+    results, booked = [], []
+    for occ in series.occurrences(scheduler_cls):
+        if occ["kind"] == "nonexistent":
+            results.append({"date": occ["local_date"], "status": "nonexistent",
+                            "detail": ("this wall-clock time does not exist on "
+                                       "this date -- the clocks went forward. "
+                                       "Not a clash, and not fixable by moving "
+                                       "the series.")})
+            continue
+        con = con_factory() if con_factory else None
+        try:
+            appt = scheduler.book(series.provider_id, series.patient_id,
+                                  series.visit_type_id, occ["utc"],
+                                  con=con, actor=actor)
+            booked.append(appt)
+            results.append({"date": occ["local_date"], "status": "booked",
+                            "appointment_id": appt,
+                            "ambiguous": occ["kind"] == "ambiguous"})
+        except SlotTaken as exc:
+            results.append({"date": occ["local_date"], "status": "clash",
+                            "detail": str(exc)})
+            if policy == "stop-at-first-clash":
+                results.append({"date": occ["local_date"], "status": "stopped",
+                                "detail": ("later occurrences not attempted: "
+                                           "this policy assumes they depend on "
+                                           "this one")})
+                break
+            if policy == "all-or-nothing":
+                break
+        except (LicenceViolation, SchedulingError) as exc:
+            results.append({"date": occ["local_date"], "status": "refused",
+                            "detail": str(exc)})
+            if policy in ("all-or-nothing", "stop-at-first-clash"):
+                break
+        finally:
+            if con is not None:
+                con.close()
+
+    failed = [r for r in results if r["status"] in ("clash", "refused")]
+    rolled_back = []
+    if policy == "all-or-nothing" and failed:
+        for appt in booked:
+            try:
+                scheduler.transition(appt, "cancelled", actor="system",
+                                     note="series rollback: all-or-nothing")
+                rolled_back.append(appt)
+            except Exception:                          # noqa: BLE001
+                pass
+
+    return {
+        "policy": policy,
+        "results": results,
+        "n_booked": 0 if rolled_back else len(booked),
+        "n_failed": len(failed),
+        "n_nonexistent": sum(1 for r in results
+                             if r["status"] == "nonexistent"),
+        "rolled_back": rolled_back,
+        "outcome": ("rolled back -- the series only makes sense complete"
+                    if rolled_back else
+                    "nothing booked" if not booked else
+                    f"{len(booked)} of {len(results)} occurrence(s) booked"),
+    }

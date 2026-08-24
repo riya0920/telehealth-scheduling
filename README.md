@@ -9,7 +9,9 @@ rather than asserted, and idempotent reminders under crash injection.
 python run_demo.py         # concurrency, licensure, DST, crash injection, tokens
 python serve.py --load     # booking p99, contended and spread
 python serve.py            # booking API on :8090
-python -m pytest tests -q  # 90 tests
+python -m pytest tests -q  # 100 tests
+python validate_rrule.py            # audit vs dateutil -> docs/
+python validate_rrule.py --sabotage  # the audit must be able to FAIL
 ```
 
 Offline, ~3 seconds, standard library only.
@@ -372,6 +374,52 @@ occurrence's wall-clock time entirely; that is a scheduling fact, not a
 conflict, and reporting it as one invites someone to "fix" it by moving the
 whole series.
 
+## The RRULE expansion is differenced against `dateutil`
+
+`src/recurrence.py` expands RFC 5545 rules by hand. `validate_rrule.py` checks
+that expansion against `python-dateutil`, which implements the standard
+properly:
+
+- **400 randomly generated rules** across the whole supported grammar
+- **212 of them carry an `EXDATE`**, so the exclusion path is exercised rather
+  than merely parsed
+- **5,963 occurrences** compared as local wall-clock dates, across five
+  timezones
+- **0 mismatches**
+
+`dateutil` is the reference for *rule expansion* only. The timezone handling is
+this project's own — local wall clock plus rule, DST resolved at expansion time
+— which is why the comparison is on local dates and DST is tested separately.
+
+### It settles a claim no test of mine could
+
+`exclude()` asserts a specific reading of RFC 5545 §3.8.5.1:
+
+> COUNT is consumed **before** EXDATE is applied, so excluding one occurrence
+> **shortens** the series rather than sliding a replacement onto the end.
+
+A unit test cannot settle that, because a test written by whoever read the spec
+encodes the same reading of it. `dateutil` is an independent reading, and it
+agrees exactly — the excluded occurrence still counts, and the series ends on
+the same date.
+
+The alternative reading is not academic. Topping the series back up to `COUNT`
+means a patient who cancels one week is silently booked an extra one.
+
+### The audit is checked for being able to fail
+
+A sweep reporting zero mismatches is worthless until you know it can report a
+non-zero one — the same lesson this portfolio kept relearning elsewhere. So the
+wrong reading is available as a switch:
+
+```bash
+python validate_rrule.py --sabotage   # 118 mismatches, and must be non-zero
+```
+
+`tests/test_rrule_reference.py` asserts **both**: that the clean sweep agrees
+everywhere, and that the sabotaged one is caught. Without the second, the first
+would pass just as happily against a generator that emitted nothing.
+
 ## What is still missing, and why it cannot be closed here
 
 - **No Postgres, therefore no exclusion constraint.** Not installed. The
@@ -394,8 +442,11 @@ whole series.
   reachable over a socket, not to be a booking service.
 - **The RRULE subset is still small.** FREQ=DAILY|WEEKLY, INTERVAL, BYDAY,
   COUNT, UNTIL, EXDATE. No MONTHLY or YEARLY, no BYSETPOS, no BYMONTHDAY, no
-  RDATE, no VTIMEZONE serialisation. `dateutil.rrule` does this properly and is
-  not installed.
+  RDATE, no VTIMEZONE serialisation. This is a **scoping decision, not a
+  missing dependency** — an earlier version of this list claimed
+  `dateutil.rrule` "is not installed", which was simply wrong. It is, and the
+  supported subset is now differenced against it (see above). What is
+  unsupported is *refused* rather than ignored.
 - **Series are not persisted.** `book_series` writes appointments, but the
   series itself lives in process memory — so a cancellation after a restart has
   no rule to attach an EXDATE to.
@@ -415,6 +466,8 @@ whole series.
 | `src/recurrence.py` | RRULE subset, local-wall-clock series, the UTC drift measured |
 | `serve.py` | booking API, series routes, contended p99 measurement |
 | `src/compact.py` | IMLC vs PSYPACT, date-of-service membership, why_not() |
+| `validate_rrule.py` | audit vs dateutil, with a --sabotage switch that must fail |
+| `tests/test_rrule_reference.py` | 10 tests: the sweep, and that the sweep can fail |
 | `tests/test_compact.py` | 23 tests: the pathway/authority split, EXDATE, three policies |
 | `tests/test_recurrence.py` | 20 tests: expansion, drift, and both readings of a move |
 | `tests/test_scheduling.py` | 47 tests |

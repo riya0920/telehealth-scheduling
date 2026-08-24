@@ -9,7 +9,7 @@ rather than asserted, and idempotent reminders under crash injection.
 python run_demo.py         # concurrency, licensure, DST, crash injection, tokens
 python serve.py --load     # booking p99, contended and spread
 python serve.py            # booking API on :8090
-python -m pytest tests -q  # 100 tests
+python -m pytest tests -q  # 111 tests
 python validate_rrule.py            # audit vs dateutil -> docs/
 python validate_rrule.py --sabotage  # the audit must be able to FAIL
 ```
@@ -420,6 +420,50 @@ python validate_rrule.py --sabotage   # 118 mismatches, and must be non-zero
 everywhere, and that the sabotaged one is caught. Without the second, the first
 would pass just as happily against a generator that emitted nothing.
 
+## Series survive a restart, so a cancellation has a rule to attach to
+
+`book_series` used to write appointments and keep the `Series` in **process
+memory**. The appointments survive a restart; the rule that explains them did
+not. A cancellation then had nothing to attach an `EXDATE` to, and the only
+remaining move was to **delete** an appointment — which loses the fact that the
+series ever included that date, and leaves the remaining rows looking like a
+series that always skipped it.
+
+A `series` table now stores the rule, `appointment.series_id` links each
+booking back to it, and `cancel_occurrence()` does **both halves**:
+
+```
+load_series(s, "ser-1")        # all a restart would have
+  -> 2026-09-08  09-15  09-22  09-29
+cancel_occurrence(s, "ser-1", "2026-09-15")
+  -> 2026-09-08  ─────  09-22  09-29     rule now carries EXDATE=20260915
+                                          appointment cancelled and audited
+```
+
+Doing only the rule half leaves a booked appointment for a date the rule now
+excludes — the slot stays occupied and the patient still gets a reminder. Doing
+only the appointment half is the old behaviour: the booking disappears, the rule
+still claims the date, and any re-expansion books it straight back.
+
+**The rule is stored as RRULE text, not as expanded occurrences** — the same
+reasoning as `Series` storing wall clock plus a rule. An expansion cannot
+survive a DST change and cannot be edited without rewriting every row. And
+COUNT-before-EXDATE still holds after the round trip, which matters because a
+patient who cancelled one week being booked an extra one is a bug that would
+*only* appear after a restart.
+
+### Two things this turned up in passing
+
+**`Scheduler.connect()` opens a different database.** On the default
+`":memory:"` path every call creates a **separate, empty** SQLite database. A
+first draft used it to persist the rule, wrote into a database nothing else
+could see, and then reported that the series did not exist. Persistence uses
+`scheduler.con`, as the rest of the class does.
+
+**The appointment insert was positional.** `VALUES (?,?,?,?,?,?,?,?,?)` shifts
+every value one place the moment a column is added — and the shifted row still
+inserts. The columns are named now.
+
 ## What is still missing, and why it cannot be closed here
 
 - **No Postgres, therefore no exclusion constraint.** Not installed. The
@@ -447,9 +491,11 @@ would pass just as happily against a generator that emitted nothing.
   `dateutil.rrule` "is not installed", which was simply wrong. It is, and the
   supported subset is now differenced against it (see above). What is
   unsupported is *refused* rather than ignored.
-- **Series are not persisted.** `book_series` writes appointments, but the
-  series itself lives in process memory — so a cancellation after a restart has
-  no rule to attach an EXDATE to.
+- **Series are persisted, but there is no series EDITING.** The rule can be
+  stored, reloaded and have occurrences excluded (see above). What is missing
+  is changing a live series — moving it an hour later from next month, or
+  splitting it — which needs a versioning story the single `rrule` column does
+  not have.
 - **No overbooking or capacity policy**, no provider panels, no group visits,
   no interpreter or resource scheduling.
 - **The load measurement is a floor, not a service level.** One process,
@@ -467,6 +513,7 @@ would pass just as happily against a generator that emitted nothing.
 | `serve.py` | booking API, series routes, contended p99 measurement |
 | `src/compact.py` | IMLC vs PSYPACT, date-of-service membership, why_not() |
 | `validate_rrule.py` | audit vs dateutil, with a --sabotage switch that must fail |
+| `tests/test_series_persistence.py` | 11 tests, all working through storage only |
 | `tests/test_rrule_reference.py` | 10 tests: the sweep, and that the sweep can fail |
 | `tests/test_compact.py` | 23 tests: the pathway/authority split, EXDATE, three policies |
 | `tests/test_recurrence.py` | 20 tests: expansion, drift, and both readings of a move |

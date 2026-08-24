@@ -72,7 +72,7 @@ which is the part the schedulers get wrong.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 WEEKDAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
@@ -426,8 +426,150 @@ def exclude(series, when):
 # booking a series
 # ---------------------------------------------------------------------------
 
+def save_series(scheduler, series, con=None, status="active"):
+    """Persist the RULE, so a restart does not orphan the appointments.
+
+    THE GAP THIS CLOSES. `book_series` wrote appointments and kept the Series
+    in process memory. The appointments survive a restart; the rule that
+    explains them does not. A cancellation then has nothing to attach an
+    EXDATE to, and the only remaining move is to DELETE an appointment -- which
+    loses the fact that the series ever included that date, and leaves the
+    remaining rows looking like a series that always skipped it.
+
+    Stored as RRULE TEXT, not as expanded occurrences, for the same reason
+    `Series` stores wall clock plus a rule: expansions cannot survive a DST
+    change and cannot be edited without rewriting every row.
+    """
+    # scheduler.con, NOT scheduler.connect(). On the default ":memory:" path
+    # every connect() opens a SEPARATE, EMPTY database -- so a fresh connection
+    # here would write the rule into a database nothing else can see, and
+    # reading it back would report the series does not exist.
+    own = False
+    con = con or scheduler.con
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO series (series_id, provider_id, "
+            "patient_id, visit_type_id, anchor_date, hour, minute, tz, rrule, "
+            "duration_minutes, status, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (series.series_id, series.provider_id, series.patient_id,
+             series.visit_type_id, series.anchor_date.isoformat(),
+             series.hour, series.minute, str(series.tz),
+             format_rrule(series.rule), series.duration_minutes, status,
+             datetime.now(UTC).isoformat()))
+        con.commit()
+    finally:
+        if own:
+            con.close()
+    return series.series_id
+
+
+def load_series(scheduler, series_id, con=None):
+    """Rebuild a Series from storage, or None. The rule comes back intact."""
+    # scheduler.con, NOT scheduler.connect(). On the default ":memory:" path
+    # every connect() opens a SEPARATE, EMPTY database -- so a fresh connection
+    # here would write the rule into a database nothing else can see, and
+    # reading it back would report the series does not exist.
+    own = False
+    con = con or scheduler.con
+    try:
+        row = con.execute(
+            "SELECT provider_id, patient_id, visit_type_id, anchor_date, "
+            "hour, minute, tz, rrule, duration_minutes, status "
+            "FROM series WHERE series_id = ?", (series_id,)).fetchone()
+    finally:
+        if own:
+            con.close()
+    if row is None:
+        return None
+    (provider, patient, visit_type, anchor, hour, minute, tz, rrule,
+     duration, _status) = row
+    return Series(series_id, provider, patient, visit_type, anchor, hour,
+                  minute, tz, rrule, duration_minutes=duration)
+
+
+def list_series(scheduler, patient_id=None, con=None):
+    # scheduler.con, NOT scheduler.connect(). On the default ":memory:" path
+    # every connect() opens a SEPARATE, EMPTY database -- so a fresh connection
+    # here would write the rule into a database nothing else can see, and
+    # reading it back would report the series does not exist.
+    own = False
+    con = con or scheduler.con
+    try:
+        if patient_id:
+            rows = con.execute(
+                "SELECT series_id FROM series WHERE patient_id = ? "
+                "ORDER BY series_id", (patient_id,)).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT series_id FROM series ORDER BY series_id").fetchall()
+    finally:
+        if own:
+            con.close()
+    return [r[0] for r in rows]
+
+
+def cancel_occurrence(scheduler, series_id, when, con=None, actor="patient"):
+    """Cancel ONE occurrence of a PERSISTED series: EXDATE plus appointment.
+
+    This is the operation the gap list said was impossible after a restart, and
+    it has to do BOTH halves or it is worse than neither:
+
+      * add the EXDATE to the STORED rule, so the series itself records that
+        this date was cancelled rather than silently never existing
+      * cancel the APPOINTMENT, so the slot is actually free
+
+    Doing only the first leaves a booked appointment for a date the rule now
+    excludes. Doing only the second is the old behaviour -- the appointment
+    disappears and the rule still claims the date, so any re-expansion books it
+    straight back.
+    """
+    # scheduler.con, NOT scheduler.connect(). On the default ":memory:" path
+    # every connect() opens a SEPARATE, EMPTY database -- so a fresh connection
+    # here would write the rule into a database nothing else can see, and
+    # reading it back would report the series does not exist.
+    own = False
+    con = con or scheduler.con
+    try:
+        series = load_series(scheduler, series_id, con=con)
+        if series is None:
+            raise RecurrenceError("no persisted series %r" % series_id)
+
+        updated = exclude(series, when)
+        con.execute("UPDATE series SET rrule = ? WHERE series_id = ?",
+                    (format_rrule(updated.rule), series_id))
+
+        target = when if isinstance(when, date) else date.fromisoformat(
+            str(when)[:10])
+        cancelled = []
+        rows = con.execute(
+            "SELECT appointment_id, starts_at_utc FROM appointment "
+            "WHERE series_id = ? AND status = 'confirmed'",
+            (series_id,)).fetchall()
+        for appt_id, starts in rows:
+            local = datetime.fromisoformat(starts).astimezone(series.tz)
+            if local.date() == target:
+                con.execute(
+                    "UPDATE appointment SET status = 'cancelled' "
+                    "WHERE appointment_id = ?", (appt_id,))
+                con.execute(
+                    "INSERT INTO appointment_audit (appointment_id, at, "
+                    "actor, from_status, to_status, note) VALUES (?,?,?,?,?,?)",
+                    (appt_id, datetime.now(UTC).isoformat(), actor,
+                     "confirmed", "cancelled",
+                     "series %s EXDATE %s" % (series_id, target.isoformat())))
+                cancelled.append(appt_id)
+        con.commit()
+    finally:
+        if own:
+            con.close()
+    return {"series_id": series_id, "excluded": target.isoformat(),
+            "appointments_cancelled": cancelled,
+            "rrule": format_rrule(updated.rule)}
+
+
 def book_series(series, scheduler, scheduler_cls, *, policy="best-effort",
-                actor="patient", con_factory=None):
+                actor="patient", con_factory=None, persist=True):
     """Book every occurrence. Returns what happened to each.
 
     THE PARTIAL-FAILURE STORY, which is the named gap: "book 8 occurrences and
@@ -475,7 +617,8 @@ def book_series(series, scheduler, scheduler_cls, *, policy="best-effort",
         try:
             appt = scheduler.book(series.provider_id, series.patient_id,
                                   series.visit_type_id, occ["utc"],
-                                  con=con, actor=actor)
+                                  con=con, actor=actor,
+                                  series_id=series.series_id)
             booked.append(appt)
             results.append({"date": occ["local_date"], "status": "booked",
                             "appointment_id": appt,
@@ -510,6 +653,19 @@ def book_series(series, scheduler, scheduler_cls, *, policy="best-effort",
                 rolled_back.append(appt)
             except Exception:                          # noqa: BLE001
                 pass
+
+    if persist and booked and not rolled_back:
+        # AFTER booking, and only if something WAS booked. A stored rule with
+        # no appointments is a claim the data cannot support -- and an
+        # all-or-nothing rollback must not leave a series behind describing
+        # appointments that were undone.
+        #
+        # No try/except here. An earlier draft swallowed the exception on the
+        # grounds that "the appointments are already correct", which is exactly
+        # how a series silently fails to persist and the gap this closes
+        # reopens without anyone noticing. If the rule cannot be stored, the
+        # caller needs to know.
+        save_series(scheduler, series)
 
     return {
         "policy": policy,

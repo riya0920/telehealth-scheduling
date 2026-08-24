@@ -108,10 +108,42 @@ CREATE TABLE appointment (
     ends_at_utc   TEXT NOT NULL,
     status        TEXT NOT NULL,
     service_state TEXT,
-    created_at    TEXT
+    created_at    TEXT,
+    -- Which series produced this appointment, if any. Nullable: most
+    -- appointments are one-offs and should not have to pretend otherwise.
+    series_id     TEXT
 );
 CREATE INDEX idx_appt_provider ON appointment(provider_id, starts_at_utc);
 CREATE INDEX idx_appt_patient  ON appointment(patient_id, starts_at_utc);
+
+-- THE RULE ITSELF, PERSISTED.
+--
+-- book_series used to write appointments and keep the Series in process
+-- memory. That works until the process restarts, at which point the
+-- appointments still exist and the RULE THAT EXPLAINS THEM does not -- so a
+-- cancellation has nothing to attach an EXDATE to, and the only remaining
+-- option is to delete an appointment, which loses the fact that the series
+-- ever included that date.
+--
+-- The rule is stored as its RRULE TEXT rather than as expanded occurrences,
+-- for the same reason Series stores local wall clock plus a rule: expanded
+-- occurrences cannot answer "what does this series mean" after a DST change,
+-- and cannot be edited without rewriting every row.
+CREATE TABLE series (
+    series_id     TEXT PRIMARY KEY,
+    provider_id   TEXT NOT NULL,
+    patient_id    TEXT NOT NULL,
+    visit_type_id TEXT NOT NULL,
+    anchor_date   TEXT NOT NULL,
+    hour          INTEGER NOT NULL,
+    minute        INTEGER NOT NULL,
+    tz            TEXT NOT NULL,
+    rrule         TEXT NOT NULL,
+    duration_minutes INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'active',
+    created_at    TEXT
+);
+CREATE INDEX idx_appt_series ON appointment(series_id);
 
 CREATE TABLE appointment_audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -417,7 +449,7 @@ class Scheduler:
 
     # -- booking ---------------------------------------------------------
     def book(self, provider_id, patient_id, visit_type_id, start_utc,
-             con=None, actor="patient"):
+             con=None, actor="patient", series_id=None):
         """Book a slot. Raises SlotTaken or LicenceViolation.
 
         The check and the write happen inside ONE `BEGIN IMMEDIATE`
@@ -463,10 +495,17 @@ class Scheduler:
                 raise SlotTaken(f"patient {patient_id} already has an "
                                 f"overlapping appointment")
             con.execute(
-                "INSERT INTO appointment VALUES (?,?,?,?,?,?,?,?,?)",
+                # Columns NAMED, not positional. The previous form was
+                # `VALUES (?,?,?,?,?,?,?,?,?)`, which silently shifts every
+                # value one place the moment a column is added -- and the
+                # shifted row still inserts.
+                "INSERT INTO appointment (appointment_id, provider_id, "
+                "patient_id, visit_type_id, starts_at_utc, ends_at_utc, "
+                "status, service_state, created_at, series_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (appt_id, provider_id, patient_id, visit_type_id,
                  _iso(start_utc), _iso(end_utc), "confirmed", state,
-                 datetime.now(UTC).isoformat()))
+                 datetime.now(UTC).isoformat(), series_id))
             con.execute(
                 "INSERT INTO appointment_audit "
                 "(appointment_id, at, actor, from_status, to_status, note) "

@@ -1,4 +1,4 @@
-# SE-3 — Telehealth scheduling correctness — complete
+# SE-3 — Telehealth scheduling correctness — working system, 9 known gaps
 
 Scheduling looks like a CRUD tutorial and is a constraint-satisfaction
 minefield. This builds the mines: licensure by state **on the date of service**,
